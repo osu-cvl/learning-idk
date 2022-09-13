@@ -18,7 +18,7 @@ The contents of this repo are organized as follows:
 * SciPy
 * Matplotlib
 
-with specific versions given in [requirements.txt](requirements.txt). To reproduce the environment using conda run ```conda create -n <environment-name> --file requirements.txt```.
+with specific versions given in [requirements.txt](requirements.txt). To reproduce the environment using conda run ```conda create -c conda-forge -c pytorch -n <environment-name> --file requirements.txt```.
 
 ## Learning Thresholds
 
