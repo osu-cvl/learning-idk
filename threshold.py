@@ -1,10 +1,10 @@
 """
 Paper: Learning When to Say "I Don't Know"
-arXiv Link: https://arxiv.org/pdf/2110.13989.pdf
+arXiv Link: https://arxiv.org/abs/2209.04944
 Authors: Nicholas Kashani Motlagh*, Jim Davis*, 
          Tim Anderson+, and Jeremy Gwinnup+
 Affiliation: *Department of Computer Science & Engineering, Ohio State University
-             +Air Force Research Laboratory, Wright Patterson AFB
+             +Air Force Research Laboratory, Wright-Patterson AFB
 Corresponding Email: kashanimotlagh.1@osu.edu (First: Nicholas, Last: Kashani Motlagh)
 Date: Sep 6, 2022
 This research was supported by the U.S. Air Force Research Laboratory under Contract #GRT00054740 (Release #AFRL-2022-3339). 
@@ -22,9 +22,10 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 # Local imports
-from temperature_scaling import ModelWithTemperature, PerClassECE
+from temperature_scaling import ModelWithTemperature
 
-### User Options ###
+# DEFAULTS
+# Output Path for thresholds
 DEFAULT_THRESHOLD_PATH = "thresholds.pt"
 # Temperature scaling
 N_BINS = 15
@@ -42,7 +43,7 @@ def _parse_args():
     Command-line arguments to the system.
     :return: the parsed args bundle
     """
-    parser = argparse.ArgumentParser(description='trainer.py')
+    parser = argparse.ArgumentParser(description='threshold.py')
     parser.add_argument('--threshold_path', type=str, default=DEFAULT_THRESHOLD_PATH, help='Path to save computed thresholds')    
     parser.add_argument('--data_path', type=str, default=None, help='Path to validation data (logits,targets)')
     parser.add_argument('--test_data_path', type=str, default=None, help='Path to test data (logits,targets)')    
@@ -109,10 +110,10 @@ def load_decisions(data_path):
     
 def get_logits_loader(logits, targets):
     """Generates a dataloader from a path of logits, targets.
-
+    
     Args:
-        data_path (str or Path): Path to data (logits, targets).
-        synth (bool, optional): Flag indicating whether data is synthetic. Defaults to False.
+        logits (torch.tensor): Tensor of logits.
+        targets (torch.tensor): Tensor of targets.
 
     Returns:
         DataLoader: DataLoader for data in data_path.
@@ -155,17 +156,16 @@ def get_ts_data(model_ts, dataloader):
     return all_ts_logits, all_targets
     
 def wilson_cc_bound(k, n, delta=DELTA):
-    """Generates a lower or upper bound using the Wilson interval with continuity correction.
-    If delta <= 0.5, then the lower bound is taken, otherwise the upper bound. This strategy 
-    ensures bounds are sensible and is equivalent to the Binomial CDF with delta area in the tail.
+    """Generates a (1-delta) upper bound using the Wilson interval with continuity correction.
+    This strategy is approximately equivalent to the Binomial CDF with delta area in the tail.
 
     Args:
-        count (_type_): _description_
-        nobs (_type_): _description_
-        delta (_type_, optional): _description_. Defaults to DELTA.
+        k (int): Number of sucesses
+        n (int): Number of trials
+        delta (float, optional): User defined significance level. Defaults to DELTA (0.05).
 
     Returns:
-        float: The upper or lower bound.
+        float: The upper bound.
     """
     p = k/n
     q = 1.-p
@@ -173,7 +173,6 @@ def wilson_cc_bound(k, n, delta=DELTA):
     z2 = z**2   
     denom = 2*(n+z2)
     num = 2.*n*p+z2+1.+z*np.sqrt(z2+2-1./n+4*p*(n*q-1))
- 
     bound = num/denom
     if p == 0:
         bound = 0.
@@ -182,19 +181,54 @@ def wilson_cc_bound(k, n, delta=DELTA):
     return bound
 
 def learn_thresholds(logits, targets, delta=DELTA, thresh_func=THRESH_FUNC):
+    """Learns per-class thresholds on logits using the proposed approach in the paper. The method
+    validates the reject region using thresh_func at a user-provided significance level.
+
+    Args:       
+        logits (torch.tensor): Tensor of logits.
+        targets (torch.tensor): Tensor of targets.
+        delta (float, optional): User defined significance level. Defaults to DELTA.
+        thresh_func (str, optional): Implementation used to validate reject region. Options
+        are (b_cdf, wilson, wilson_cc, clopper_pearson, agresti_coull). Defaults to THRESH_FUNC.
+
+    Returns:
+        torch.tensor: A tensor of per-class thresholds.
+    """
     num_classes = torch.unique(targets).numel()
     thresholds = torch.zeros(num_classes)
+    # Extract softmax scores
     sm_scores = torch.softmax(logits, dim=1)
     max_sms, preds = torch.max(sm_scores, dim=1)
+    # Compute per-class thresholds
     for c in range(num_classes):
         class_idx = torch.where(preds == c)[0]
         thresholds[c] = learn_class_threshold(preds[class_idx], max_sms[class_idx], targets[class_idx], delta, thresh_func)
     return thresholds
 
 def accuracy(is_correct):
+    """Computes accuracy from a binary tensor.
+
+    Args:
+        is_correct (bool): Binary tensor of successes and failures.
+
+    Returns:
+        float: Accuracy of the trials.
+    """
     return torch.sum(is_correct) / is_correct.numel()
 
 def check_reject(preds, targets, delta, thresh_func):
+    """Validate whether the reject region is viable using thresh_func at a delta significance level.
+
+    Args:
+        preds (torch.tensor): Tensor of predictions.
+        targets (torch.tensor): Tensor of targets.
+        delta (float, optional): User defined significance level. Defaults to DELTA.
+        thresh_func (str, optional): Implementation used to validate reject region. Options
+        are (b_cdf, wilson, wilson_cc, clopper_pearson, agresti_coull). Defaults to THRESH_FUNC.
+
+    Returns:
+        bool: Whether the reject region is viable using thresh_func at a user defined significance level.
+    """
     is_correct = (preds == targets)
     k, n = torch.sum(is_correct), is_correct.numel()
     if thresh_func == "b_cdf":
@@ -204,56 +238,96 @@ def check_reject(preds, targets, delta, thresh_func):
     else:
         if thresh_func == "clopper_pearson":
             thresh_func = "beta"
+        # We need a 1-delta single tail upper bound so alpha=2*(1-delta)
         _, ci_u = proportion_confint(k, n, alpha=2*(1-delta), method=thresh_func)
         return ci_u <= 0.5
 
 def learn_class_threshold(preds, max_sms, targets, delta, thresh_func):
+    """Learns a threshold for a single class using thresh_func at a user-defined significance level delta.
+
+    Args:
+        preds (torch.tensor): Tensor of predictions.
+        max_sms (torch.tensor): Tensor of softmax scores corresponding to predictions
+        targets (torch.tensor): Tensor of targets.
+        delta (float, optional): User defined significance level. Defaults to DELTA.
+        thresh_func (str, optional): Implementation used to validate reject region. Options
+        are (b_cdf, wilson, wilson_cc, clopper_pearson, agresti_coull). Defaults to THRESH_FUNC.
+
+
+    Returns:
+        float: Threshold that optimizes select accuracy while adhering to constraint.
+    """
+    # Only need to check thresholds that optimize select accuracy
     incorrect_idx = torch.where(preds != targets)[0]
     possible_thresholds = torch.unique(max_sms[incorrect_idx])
     best_thresh, best_cov = 0, -1
+    # Select accuracy
     best_sacc = accuracy(preds == targets)
-    
+    # Check possible thresholds
     for thresh in possible_thresholds:
         select_idx = torch.where(max_sms > thresh)[0]
         reject_idx = torch.where(max_sms <= thresh)[0]
         if select_idx.numel() > 0:
             sacc = accuracy(preds[select_idx] == targets[select_idx])
         else:
+            # The select accuracy is undefined so reject all
             sacc = 1.1
+        # Get coverage
         cov = select_idx.numel() / (select_idx.numel() + reject_idx.numel())
-        
+        # Check reject region
         if check_reject(preds[reject_idx], targets[reject_idx], delta, thresh_func):
+            # Optimize select accuracy / coverage
             if sacc > best_sacc or (sacc == best_sacc and cov > best_cov):
                 best_thresh = thresh
                 best_sacc = sacc
                 best_cov = cov
-    
+
     return best_thresh
 
 def sanity_check(logits, targets):
+    """A quick sanity check that prints the accuracy of logits against targets. This ensures logits and targets
+    were loaded in correctly.
+
+    Args:
+        logits (torch.tensor): Tensor of logits.
+        targets (torch.tensor): Tensor of targets.
+    """
     print(f"Base accuracy: {accuracy(torch.argmax(logits, dim=1) == targets)}")
 
 def evaluate(logits, targets, thresholds, decisions=None):
+    """Computes the select accuracy, reject accuracy, and coverage of the logits/targets using thresholds.
+    If decisions are provided (in the case of equal-density synthetic data), then IDA will also be computed.
+
+    Args:
+        logits (torch.tensor): Tensor of logits.
+        targets (torch.tensor): Tensor of targets.
+        thresholds (torch.tensor): Tensor of per-class thresholds.
+        decisions (torch.tensor, optional): Tensor of ideal decisions used to compute IDA.
+        Only applies for synthetic equal-density datasets. Defaults to None.
+    """
+    # Get softmax scores
     sm_scores = torch.softmax(logits, dim=1)
     max_sms, preds = torch.max(sm_scores, dim=1)
+    # Get tensor of corresponding thresholds for each prediction
     class_thresholds = thresholds[preds]
     select_idx = torch.where(max_sms > class_thresholds)[0]
     reject_idx = torch.where(max_sms <= class_thresholds)[0]
+    # Compute select accuracy
     if select_idx.numel() > 0:
         sacc = accuracy(preds[select_idx] == targets[select_idx])
     else:
         sacc = -1
-    
+    # Compute reject accuracy
     if reject_idx.numel() > 0:
         racc = accuracy(preds[reject_idx] == targets[reject_idx])
     else:
         racc = -1
-        
+    # Compute coverage
     cov = select_idx.numel() / (select_idx.numel() + reject_idx.numel())
     print(f"Select Accuracy: {sacc * 100 :.1f}")
     print(f"Reject Accuracy: {racc * 100 :.1f}")
     print(f"Coverage: {cov * 100 :.1f}")
-    
+    # Compute IDA
     if decisions is not None:
         selected = (max_sms > class_thresholds)
         ida = accuracy(selected == decisions)
@@ -298,10 +372,11 @@ def main(data_path, threshold_path=DEFAULT_THRESHOLD_PATH, synth=False, delta=DE
     thresholds = learn_thresholds(logits, targets, delta=delta, thresh_func=thresh_func)
     torch.save(thresholds, threshold_path)
     
-    # Evaluate thresholds
+    # Evaluate thresholds on validation data
     print(f"Evaluating {data_path}")
     evaluate(logits, targets, thresholds, decisions=decisions)
     
+    # Evaluate on test data
     if test_data_path:
         print(f"Evaluating {test_data_path}")
         evaluate(test_logits, test_targets, thresholds, test_decisions)
