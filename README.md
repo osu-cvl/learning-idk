@@ -12,11 +12,11 @@ The contents of this repo are organized as follows:
 * [temperature_scaling.py](temperature_scaling.py): a class that implements temperature scaling (taken from [another repo](https://github.com/osu-cvl/calibration/tree/main/temperature_scaling)).
 
 ## Main Requirements
-* PyTorch
-* statsmodels
-* NumPy
-* SciPy
 * Matplotlib
+* NumPy
+* PyTorch
+* SciPy
+* statsmodels
 
 with specific versions given in [requirements.txt](requirements.txt). To reproduce the environment using conda run ```conda create -c conda-forge -c pytorch -n <environment-name> --file requirements.txt```.
 
